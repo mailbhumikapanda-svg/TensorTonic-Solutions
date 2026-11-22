@@ -1,289 +1,487 @@
 # Cross Entropy Loss (Mean Reduction)
 
-Cross entropy is the first kernel in the curriculum that needs **cross-program** combination. Each program computes a per-row scalar—the negative log likelihood of that row's target—and every row's scalar is added into a single global loss value before the host divides by the batch size.
+This kernel introduces **cross-program reduction**: each Triton program computes one row's negative log-likelihood, and all programs combine those scalars into a single loss value.
 
-The numerical core is log-sum-exp: subtract the row maximum before exponentiating so the largest exponent is exactly zero. This prevents overflow while requiring only one pass over each logits row.
+The key numerical technique is **log-sum-exp**. Subtracting the row maximum before exponentiation keeps the largest exponent exactly $e^0=1$ and prevents overflow.
 
 ---
 
-## The Operation
+## Operation
 
-Given logits of shape $(B, C)$ and integer targets of shape $(B,)$, mean-reduction cross entropy is
-
-$$
-\text{loss} = \frac{1}{B}\sum_{i=0}^{B-1}\left(\log\sum_{c=0}^{C-1}e^{\texttt{logits}[i,c]}-\texttt{logits}[i,t_i]\right).
-$$
-
-The per-row term is the gap between the row's log-sum-exp and the logit at the target index. Let
+Given logits $X \in \mathbb{R}^{B\times C}$ and integer targets $t \in \{0,\ldots,C-1\}^{B}$, mean cross entropy is
 
 $$
-m_i = \max_c \texttt{logits}[i,c].
+L = \frac{1}{B}\sum_{i=0}^{B-1}
+\left(
+\log\left(\sum_{c=0}^{C-1}e^{X_{i,c}}\right)-X_{i,t_i}
+\right).
 $$
 
-Factoring out $m_i$ gives the numerically stable form:
+For row $i$, let
 
 $$
-\text{loss}_i=m_i+\log\sum_{c=0}^{C-1}e^{\texttt{logits}[i,c]-m_i}-\texttt{logits}[i,t_i].
+m_i=\max_{0\leq c<C}X_{i,c}.
 $$
 
-After the substitution, the largest exponent inside the sum is exactly zero. The sum therefore lies in $[1,C]$, and its logarithm lies in $[0,\log C]$. Without this subtraction, direct $e^{\texttt{logits}}$ can overflow fp32 for logits above roughly $88$.
+The stable per-row expression is
+
+$$
+L_i=m_i+
+\log\left(\sum_{c=0}^{C-1}e^{X_{i,c}-m_i}\right)
+-X_{i,t_i}.
+$$
+
+Since at least one shifted exponent is exactly zero,
+
+$$
+1\leq\sum_c e^{X_{i,c}-m_i}\leq C.
+$$
+
+Consequently,
+
+$$
+0\leq\log\left(\sum_c e^{X_{i,c}-m_i}\right)\leq\log C.
+$$
+
+This keeps exponentiation bounded regardless of the absolute logit values, provided those values are finite.
+
+> Directly evaluating $e^{X_{i,c}}$ in fp32 can overflow around $88$, even if the final cross-entropy value is finite.
 
 ---
 
 ## Kernel Contract
 
-The implementation in `triton-cross-entropy.py` expects:
+The implementation in [`triton-cross-entropy.py`](./triton-cross-entropy.py) uses:
 
-- `logits`: a contiguous 2-D fp32 tensor of shape $(B,C)$
-- `target`: a 1-D integer tensor of shape $(B,)$
-- `loss_out`: a preallocated 1-D tensor containing one fp32 accumulator
-- Valid target indices satisfying $0 \leq t_i < C$
-- $B>0$ and $C>0$, because this implementation does not validate either case
+| Argument | Type and shape | Purpose |
+|---|---|---|
+| `logits` | 2-D contiguous fp32 tensor $(B,C)$ | Row-wise logit values |
+| `target` | 1-D integer tensor $(B,)$ | Target class for each row |
+| `loss_out` | 1-D fp32 tensor $(1,)$ | Global fp32 accumulator |
+| `stride_logits_row` | Python/int argument | Row stride of `logits` |
+| `B`, `C` | Python/int arguments | Batch and class dimensions |
+| `BLOCK_SIZE` | `tl.constexpr` | Tile width; normally `next_power_of_2(C)` |
 
-The Triton kernel returns no tensor. It atomically adds each row's loss into `loss_out[0]`, and the host wrapper divides that accumulator by $B$.
-
-The wrapper should also use a loss accumulator with the same dtype and device as the logits:
+The wrapper should preallocate and zero the accumulator:
 
 ```python
 loss_out = torch.zeros((1,), dtype=logits.dtype, device=logits.device)
 loss_out.zero_()
 ```
 
-The explicit `zero_()` is part of the contract. It prevents stale values from a previous launch or call.
+It should then launch one Triton program per row and divide once on the host:
+
+```python
+cross_entropy_kernel[(B,)](
+    logits,
+    target,
+    loss_out,
+    logits.stride(0),
+    B,
+    C,
+    BLOCK_SIZE=triton.next_power_of_2(C),
+)
+loss = loss_out[0] / B
+```
+
+The kernel's contract assumes:
+
+- $B>0$
+- $C>0$
+- `logits` is 2-D and contiguous
+- `target` is 1-D with length $B$
+- $0\leq t_i<C$ for every row
+- `target` and `logits` are on the same device
+
+The standalone implementation does not currently perform shape or bounds validation; validate these values in the host wrapper or a test harness.
 
 ---
 
 ## Program Decomposition
 
-Rows are independent up to the final mean. The launch grid is $(B,)$, with one Triton program per row.
+The launch grid is $(B,)$, with exactly one Triton program for each row.
 
 Each program:
 
-1. Reads its row index with `tl.program_id(0)`.
-2. Loads the entire row's logits tile.
-3. Computes the row maximum with `tl.max`.
-4. Subtracts the maximum, exponentiates, and sums with `tl.sum`.
-5. Loads the target and target logit.
-6. Atomically adds the resulting row loss to `loss_out[0]`.
+1. Gets `row = tl.program_id(0)`.
+2. Creates a one-dimensional class tile:
 
-This is the simplest cross-program reduction: one scalar per program and one length-$1$ global accumulator. An alternative is to store one scalar per row in a length-$B$ buffer and launch a separate reduction kernel. That avoids atomic contention but requires another launch and temporary storage.
+   ```python
+   cols = tl.arange(0, BLOCK_SIZE)
+   mask = cols < C
+   ```
 
-For small and medium batches, the atomic form generally has lower launch and memory costs. For very large batches, atomic contention and float32 accumulation order can become significant. The host-side `loss_out.div_(B)` is a single in-place operation and avoids adding the batch mean to the kernel's reduction.
+3. Loads the row:
+
+   ```python
+   row_ptr = logits_ptr + row * stride_logits_row + cols
+   logits = tl.load(row_ptr, mask=mask, other=-float("inf"))
+   ```
+
+4. Computes `row_max = tl.max(logits, axis=0)`.
+5. Computes the stable sum:
+
+   ```python
+   shifted = logits - row_max
+   sum_exp = tl.sum(tl.exp(shifted), axis=0)
+   lse = tl.log(sum_exp) + row_max
+   ```
+
+6. Loads the target and target logit.
+7. Atomically adds the row loss:
+
+   ```python
+   row_loss = lse - target_logit
+   tl.atomic_add(loss_out_ptr, row_loss)
+   ```
+
+Each row is independent until the final global accumulator. Atomic addition avoids a temporary length-$B$ per-row loss buffer.
+
+An alternative two-stage implementation writes every `row_loss` to an intermediate buffer and launches a separate reduction kernel. It avoids atomic contention but adds launch overhead and memory traffic.
 
 ---
 
 ## Tile Shape and Masking
 
-The tile shape is $(\texttt{BLOCK\_SIZE},)$, where
+The block width is
 
 ```python
 BLOCK_SIZE = triton.next_power_of_2(C)
 ```
 
-and `BLOCK_SIZE` is declared `tl.constexpr` in the kernel.
+and must be passed to the kernel as `tl.constexpr`.
 
-The load mask `cols < C` prevents overshoot for vocabularies or classes that do not fill the tile. The logits load must use `other=-inf`, not `0.0`:
+For $C=3$, the tile width is $4$:
 
-- A zero in `tl.max` would become the maximum for an all-negative row.
-- A zero in `tl.exp` would contribute $1$ to the exp-sum.
-- `-inf` is the additive/max identity: it does not affect `tl.max` and contributes $e^{-inf}=0$ to `tl.sum`.
+```text
+valid lanes:  [0, 1, 2]
+tail lane:    [3]
+```
 
-There is no mask on the target load. Each program loads one integer and one target logit:
+The tail mask disables the extra lane. The padded lane must contain `-inf`:
+
+```python
+other=-float("inf")
+```
+
+`-inf` is the correct neutral element for this computation:
+
+- `tl.max(...)` ignores it in favor of a finite logits value.
+- `tl.exp(-inf) == 0`, so it contributes nothing to `tl.sum(...)`.
+- Masked lanes therefore never appear in the row result.
+
+Using `0.0` is incorrect:
+
+- It can become the maximum of an all-negative row.
+- It contributes $e^0=1$ to the exponent sum.
+
+---
+
+## Target Loading
+
+The target tensor is not tiled:
 
 ```python
 target_id = tl.load(target_ptr + row)
-target_logit = tl.load(logits_ptr + row * stride_logits_row + target_id)
 ```
 
-Target-logit access is the only scalar load outside the full-row tile. The target could instead be gathered from the loaded row, but one scalar reload is simpler and avoids an extra indexed gather in the elementwise pass.
+The corresponding logit is loaded by scalar pointer arithmetic:
+
+```python
+target_logit = tl.load(
+    logits_ptr
+    + row * stride_logits_row
+    + target_id
+)
+```
+
+This is one scalar HBM or cache read for the target logit. Valid target indices must be guaranteed; Triton does not provide Python-level bounds checks for this pointer load.
 
 ---
 
-## Memory Hierarchy and Reuse
+## Memory and Reuse
 
-The logits row is loaded once into a $(\texttt{BLOCK\_SIZE},)$ tile and held in registers for:
+The logits tile is loaded once and reused for:
 
-- The row maximum.
-- The shift and exponential.
-- The exponent sum.
+- Row maximum
+- Shift-and-exponent calculation
+- Exponent sum
+- Target logit loading if the target scalar is not gathered from the row tile
 
-The target integer is loaded once, and the target logit is gathered from the logits row. There is no shared-memory stage in this kernel. The compiler lowers `tl.max` and `tl.sum` to tree reductions, likely using small staging areas between warps or threads.
+There is no shared-memory stage in this standalone kernel. `tl.max` and `tl.sum` are compiler-generated tree reductions, with staging and synchronization chosen by the Triton/target compiler.
 
-For fp32 inputs, the idealized per-row traffic is:
+For fp32 inputs, approximate per-row traffic is:
 
-- $4C$ bytes: logits tile load
-- $4$ bytes: target load
-- One scalar target-logit value: implementation-dependent cache behavior
-- $4$ bytes per program: atomic accumulator read-modify-write traffic, amortized globally
+| Operation | Approximate amount |
+|---|---:|
+| Logits tile load | $4C$ bytes |
+| Target load | $4$ bytes |
+| Target-logit load | Scalar; cache dependent |
+| Atomic accumulator update | $4$ bytes of logical work per program |
 
-The value $4C+12$ from a naïve accounting is not a reliable HBM measurement. Cache hits, the row stride, coalescing, and atomic hardware all change the observed value. Treat memory traffic estimates as bounds or order-of-magnitude comparisons rather than exact performance predictions.
+The exact HBM traffic depends on caching, stride, vectorization, coalescing, and atomic implementation. A formula such as $4C+12$ bytes should be treated only as an idealized accounting, not an exact hardware measurement.
 
 ---
 
-## Memory-Bound vs Compute-Bound
+## Performance Characterization
 
-Per fp32 logit element, the kernel performs roughly five arithmetic operations:
+Per fp32 logit element, the kernel performs approximately:
 
-- One max contribution
-- One shift subtraction
-- One exponent calculation
+- One comparison contribution for the maximum
+- One subtraction
+- One exponential
 - One sum contribution
-- An amortized share of the row log, target subtraction, and mean division
 
-With an approximate $4$-byte logits load, arithmetic intensity is
+The amortized row operations add the logarithm, target subtraction, and mean division.
+
+An approximate arithmetic intensity is
 
 $$
-\frac{\approx 5\text{ FLOPs}}{\approx 4\text{ bytes}}\approx1.25\text{ FLOPs/byte}.
+\frac{\approx5\ \text{FLOPs}}{\approx4\ \text{bytes}}
+\approx1.25\ \text{FLOPs/byte}.
 $$
 
-That is still memory-bound on modern accelerators. The exponential is expensive, but one logits load of the row is the dominant scaling term as $C$ grows.
+This is far below typical accelerator roofline crossover regions, so the kernel is primarily memory-bound for realistic logits rows. Its runtime is expected to scale with the logits read rather than solely with the exponential throughput.
 
-Fused softmax has nearly the same intensity, but writes a complete normalized row instead of one scalar. Cross entropy saves the large normalized-output write and therefore generally requires less memory bandwidth. A final run comparison is still needed because the atomic loss accumulation adds a small cross-row cost.
+Fused softmax has similar arithmetic, but writes an entire normalized $C$-element row. This cross-entropy kernel instead writes one scalar, reducing output traffic at the cost of atomic cross-row accumulation.
 
 ---
 
-## Compiler-Handled vs Author-Handled
+## Atomic Accumulation and Precision
 
-**Author chooses:**
+`tl.atomic_add` ensures that row additions update the same accumulator without individual updates being overwritten. It does not guarantee a reproducible addition order.
 
-- The $(B,)$ launch grid
-- The next-power-of-two block size
-- The tail mask
-- `other=-inf` for masked logits
-- Max-before-exp placement
-- Scalar target-logit loading
-- Atomic accumulation and host-side division
+In fp32, final values can differ in the last few digits or ULPs depending on scheduling and atomic order:
 
-**Compiler handles:**
+- Result differences are usually small.
+- Very large batch sizes can amplify drift.
+- Tighter tolerance does not improve the implementation; it can make a valid implementation fail.
 
-- Lowering `tl.max` and `tl.sum` to tree reductions
-- Selecting loads, vector widths, and register allocation
-- Scheduling the row tile operations
-- Lowering `tl.atomic_add` to the available atomic instruction
-- Inserting intra-row synchronization for reductions
+For fp32 tests, a starting tolerance may be
 
-The author remains responsible for the reduction contract at the program boundary. Atomic accumulation is not nondeterministic in the sense of losing updates, but it does not define a stable floating-point addition order. The accumulator order can vary between runs.
+```python
+atol=1e-2
+rtol=1e-2
+```
 
-For fp32 tests, a tolerance of roughly `atol=1e-2, rtol=1e-2` is reasonable for the atomic form. Tighter absolute tolerances can fail for correct implementations. The appropriate tolerance should be based on the dtype and batch size, not copied blindly from a different kernel.
+Choose tolerances from the observed dtype and batch size. For strict reproducibility, use a two-stage reduction:
+
+1. Write each row loss to a length-$B$ buffer.
+2. Sum the buffer in a deterministic or tree-structured reduction.
 
 ---
 
-## Naive vs Optimized
+## Author vs. Compiler
 
-A naïve eager PyTorch implementation may launch separate kernels for:
+### Author responsibilities
 
-- Computing the row maximum
-- Subtracting, exponentiating, and summing
-- Taking the logarithm and subtracting target logits
-- Performing the global mean reduction
+- Choose the program grid.
+- Choose the block shape.
+- Mask tail lanes.
+- Use `-inf` for padded logits.
+- Apply max-before-exp.
+- Load the target and target logit.
+- Accumulate row losses and divide once on the host.
 
-The fused Triton kernel loads and processes the logits row once, writes one scalar per program, and performs one global atomic add.
+### Compiler responsibilities
 
-For the standalone forward kernel, this is a teaching baseline rather than the final production cross-entropy implementation. Further fusion is possible:
+- Lower `tl.max` and `tl.sum` to reduction instructions or trees.
+- Allocate tile and reduction registers.
+- Choose vector and load widths.
+- Schedule elementwise and reduction operations.
+- Lower `tl.atomic_add` to an atomic instruction.
 
-- **Forward and backward:** compute softmax or logits derivatives in the same kernel family and materialize gradients directly.
-- **Vocabulary projection:** fuse the unembedding matrix multiply with cross entropy, avoiding materialization of the full $B\times C$ logits tensor.
-- **Stable two-stage reduction:** write per-row losses to a buffer and reduce them with a tree for reproducible floating-point order.
+The author decides **what is reduced** and **where reduction boundaries occur**. The compiler decides **how** those reductions are implemented on the target device.
 
-In this implementation, the standalone forward kernel assumes logits already exist in HBM. It does not fuse the matrix multiplication that produces those logits.
+---
+
+## Naive vs. Fused Implementation
+
+A non-fused eager implementation can execute separate operations for:
+
+- Row maximum
+- Stable shift and exponentiation
+- Exponent sum and logarithm
+- Target-logit subtraction
+- Batch mean reduction
+
+Each intermediate may be materialized in HBM and read again.
+
+The fused implementation:
+
+- Loads each logits row once.
+- Keeps the row tile in registers.
+- Produces only one row scalar.
+- Atomically combines $B$ scalars.
+
+Further production-level optimizations include:
+
+- **Forward/backward fusion:** compute softmax derivatives and materialize gradients in a fused path.
+- **Vocabulary-projection fusion:** combine the unembedding matrix multiply with per-token log-sum-exp and target selection.
+- **Deterministic reduction:** replace atomic summation with a per-row buffer and tree reduction.
+
+This file describes the standalone forward kernel, not the gradient or unembedding portions of a language-model training step.
 
 ---
 
 ## Worked Example
 
-Take $B=2$, $C=3$, `BLOCK_SIZE=4`,
+Let $B=2$, $C=3$, and `BLOCK_SIZE=4`. Consider
 
 $$
-\texttt{logits}=\begin{bmatrix}1&2&3\\0&0&5\end{bmatrix},\qquad
-\texttt{target}=[2,0].
+X=
+\begin{bmatrix}
+1 & 2 & 3\\
+0 & 0 & 5
+\end{bmatrix},
+\qquad
+ t=
+\begin{bmatrix}
+2\\
+0
+\end{bmatrix}.
 $$
 
 The launch grid is $(2,)$.
 
-**Program 0**, with `row=0`:
+### Program 0: $i=0$
 
-- Tile: $[1,2,3,-\infty]$
-- Row maximum: $m_0=3$
-- Shifted exponentials: $[e^{-2},e^{-1},e^0,0]=[0.1353,0.3679,1,0]$
-- Sum: $1.5032$
-- Stable log-sum-exp: $3+\log(1.5032)=3.4076$
-- Target logit: $	exttt{logits}[0,2]=3$
-- Row loss: $3.4076-3=0.4076$
+Loaded tile:
 
-**Program 1**, with `row=1`:
+$$
+[1,2,3,-\infty]
+$$
 
-- Tile: $[0,0,5,-\infty]$
-- Row maximum: $m_1=5$
-- Shifted exponentials: $[e^{-5},e^{-5},e^0,0]\approx[0.0067,0.0067,1,0]$
-- Sum: $1.0134$
-- Stable log-sum-exp: $5+\log(1.0134)
-  \approx5.0134$
-- Target logit: $	exttt{logits}[1,0]=0$
-- Row loss: $5.0134-0=5.0134$
+The maximum is $m_0=3$. The shifted exponentials are
 
-After both programs finish:
+$$
+[e^{-2},e^{-1},e^0,0]
+\approx[0.1353,0.3679,1,0],
+$$
+
+so
+
+$$
+\sum_c e^{X_{0,c}-m_0}\approx1.5032.
+$$
+
+Therefore,
+
+$$
+L_0
+=3+\log(1.5032)-X_{0,2}
+=3+0.4076-3
+=0.4076.
+$$
+
+### Program 1: $i=1$
+
+Loaded tile:
+
+$$
+[0,0,5,-\infty]
+$$
+
+The maximum is $m_1=5$. The shifted exponentials are
+
+$$
+[e^{-5},e^{-5},e^0,0]
+\approx[0.0067,0.0067,1,0],
+$$
+
+so
+
+$$
+\sum_c e^{X_{1,c}-m_1}\approx1.0135.
+$$
+
+Thus,
+
+$$
+L_1
+=5+\log(1.0135)-X_{1,0}
+=5+0.0134-0
+=5.0134.
+$$
+
+After both programs complete,
 
 $$
 \texttt{loss\_out}[0]
-=0.4076+5.0134
-\approx5.4210.
+\approx0.4076+5.0134
+=5.4210.
 $$
 
-The host divides by $B=2$:
+The host computes the mean:
 
 $$
-\text{mean loss}=5.4210/2\approx2.7105.
+L=\frac{5.4210}{2}\approx2.7105.
 $$
 
-The max subtraction is what keeps the second row finite and numerically stable. Directly exponentiating $[0,0,5]$ is still safe in this small example, but adding a logit of $100$ would produce $e^{100}$ and overflow fp32.
+The stable calculation avoids overflow. In contrast, direct $e^{100}$ overflows fp32, even though
+
+$$
+100+\log\left(\sum_c e^{X_c-100}\right)-X_{t}
+$$
+
+may remain finite.
 
 ---
 
-## Edge Cases and Validation
+## Edge Cases
 
-The standalone kernel does not implement all safeguards:
+The standalone implementation should not be called when:
 
-- $B=0$ produces division by zero in `loss_out.div_(B)`.
-- $C=0$ is not a valid logits shape and is not a meaningful tile size.
-- Target indices outside $[0,C)$ must be rejected or guarded by the caller.
-- `NaN` logits require an application-level policy because `tl.max` and `tl.sum` do not define a sensible cross-entropy value.
-- `Inf` logits need special handling. They are not silently represented by stable finite-precision arithmetic.
-- The implementation is intentionally focused on contiguous fp32 logits and integer targets.
+- $B=0$, because the host mean divides by zero.
+- $C=0$, because the log-sum-exp is undefined and no valid target exists.
+- A target is outside $[0,C)$.
+- A row contains `NaN`, unless the caller explicitly defines the required behavior.
+- A row contains `Inf`; stable finite-precision arithmetic alone does not define all corner cases involving infinities.
 
-The wrapper can validate shapes and target bounds before launching:
+A host wrapper can validate the common cases:
 
 ```python
-assert logits.ndim == 2
-assert target.shape == (logits.shape[0],)
-assert logits.shape[0] > 0
-assert logits.shape[1] > 0
-assert logits.dtype == torch.float32
-assert target.dtype in (torch.int32, torch.int64)
-assert target.min() >= 0
-assert target.max() < logits.shape[1]
+if logits.ndim != 2:
+    raise ValueError("logits must be a 2-D tensor")
+if logits.dtype != torch.float32:
+    raise TypeError("this kernel requires fp32 logits")
+
+B, C = logits.shape
+if B == 0:
+    raise ValueError("batch size must be positive")
+if C == 0:
+    raise ValueError("class count must be positive")
+if target.shape != (B,):
+    raise ValueError("target shape must be (B,)")
+if target.dtype not in (torch.int32, torch.int64):
+    raise TypeError("target must contain int32 or int64 values")
+if target.numel() and (
+    target.min().item() < 0 or target.max().item() >= C
+):
+    raise ValueError("target contains an out-of-range class index")
 ```
 
-Use a separate reduction kernel or PyTorch mean reduction if strict reproducibility across scheduling choices is required.
+Avoid evaluating `target.min()` on a device or dtype unsupported by the wrapper when an equivalent shape/type check can be performed first.
 
 ---
 
 ## Testing
 
-A useful test matrix is:
+Use this test matrix:
 
 - $B=1$, $C=1$
-- $C$ as powers of two and non-powers of two
-- All equal logits
+- Powers of two and non-powers of two for $C$
+- Equal logits
 - Large positive logits
 - Large negative logits
-- Mixed positive and negative logits
-- Random fp32 logits
-- Random valid targets
+- Mixed logits
+- Random fp32 logits and valid targets
 - Invalid target indices
 - Empty batch and empty vocabulary
-- `torch.float16`, `bfloat16`, and `float32`, if supported by the wrapper
+- Several repeated launches to observe atomic-order drift
+- Small and large batch sizes
 
-Compare each valid case with:
+Compare valid values with PyTorch:
 
 ```python
 reference = torch.nn.functional.cross_entropy(
@@ -291,24 +489,29 @@ reference = torch.nn.functional.cross_entropy(
     target,
     reduction="mean",
 )
+
+torch.testing.assert_close(
+    result,
+    reference,
+    atol=1e-2,
+    rtol=1e-2,
+)
 ```
 
-For fp32 atomic accumulation, tolerate last-ULP differences across repeated runs. Run the random comparison with several batch sizes, and test large batch sizes to expose atomic-order noise.
+For fp32, repeated launches may differ in the final ULPs. The test should verify numerical correctness without assuming a fixed atomic accumulation order.
 
 ---
 
-## Pitfalls
+## Common Pitfalls
 
-* **Skipping the max-subtraction.** Direct $\log\sum e^{\texttt{logits}}$ overflows for sufficiently large logits. Subtraction does not change the mathematical result and is required for a numerically valid implementation.
-
-* **Loading masked lanes as `0.0`.** Zero becomes the maximum for a negative row and contributes $1$ to the exp-sum. Use `other=-inf`.
-
-* **Forgetting to pre-zero the loss buffer.** `tl.atomic_add` accumulates onto the existing value. Call `loss_out.zero_()` before every launch.
-
-* **Assuming atomic reduction is stable.** Atomic updates are not lost, but float additions occur in nondeterministic order. Correct implementations can differ in the last few decimal digits between runs.
-
-* **Using a one-pass target gather without bounds checks.** Target load must be in range. Triton does not necessarily provide the same Python-level shape or bounds validation that PyTorch supplies.
-
-* **Comparing memory traffic by logits size alone.** Cache behavior, dtype, stride, and atomic read-modify-write traffic prevent exact bandwidth formulas from characterizing a real launch.
+- **Skipping max subtraction** — Direct exponentiation can overflow for moderate positive logits.
+- **Using `0.0` as the padded value** — It is neither the max identity nor the exp-sum identity.
+- **Forgetting `loss_out.zero_()`** — Atomic adds accumulate on stale values.
+- **Calling this kernel with $B=0$** — The host-side mean is undefined and divides by zero.
+- **Passing an out-of-range target** — The target-logit scalar load can access invalid memory.
+- **Expecting exact reproducibility** — Atomic order is nondeterministic for floating-point sums.
+- **Treating $4C+12$ as exact HBM traffic** — Cache hits and hardware atomics change the real transfer count.
+- **Using an incorrectly typed accumulator** — Accumulate in a dtype compatible with the logits and test the wrapper contract.
+- **Tightening tolerance below atomic drift** — A correct kernel may differ by a few ULPs across launches.
 
 ---
